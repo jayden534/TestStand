@@ -7,13 +7,15 @@ local RunService = game:GetService("RunService")
 local LOCAL_PLAYER = Players.LocalPlayer
 
 local FOLLOW_DISTANCE = 3
-local HOVER_HEIGHT = 0.65
+local HOVER_HEIGHT = 2
 local HOVER_AMPLITUDE = 0.18
 local HOVER_SPEED = 2.4
 local MAX_SPEED = 42
 local POSITION_GAIN = 5.5
 local ACCELERATION = 10
 local TURN_SPEED = 12
+local IDLE_ANIMATION_ID = "rbxassetid://137753000414955"
+local MOVE_ANIMATION_ID = "rbxassetid://73602135057541"
 
 local Controller = {}
 Controller.__index = Controller
@@ -65,10 +67,38 @@ function Controller.new(owner)
 		MotionConnection = nil,
 		BodyVelocity = nil,
 		Orientation = nil,
+		IdleTrack = nil,
+		MoveTrack = nil,
+		ActiveTrack = nil,
 		PreviousPlatformStand = false,
 		CurrentVelocity = Vector3.zero,
 		StartedAt = 0,
 	}, Controller)
+end
+
+local function loadLoopedAnimation(humanoid, animationId)
+	local animator = humanoid:FindFirstChildOfClass("Animator")
+	if not animator then
+		animator = Instance.new("Animator")
+		animator.Parent = humanoid
+	end
+
+	local animation = Instance.new("Animation")
+	animation.AnimationId = animationId
+	local track = animator:LoadAnimation(animation)
+	animation:Destroy()
+	track.Looped = true
+	track.Priority = Enum.AnimationPriority.Action
+	return track
+end
+
+function Controller:_playTrack(track)
+	if not track or self.ActiveTrack == track then return end
+	if self.ActiveTrack then
+		self.ActiveTrack:Stop(0.15)
+	end
+	self.ActiveTrack = track
+	track:Play(0.15)
 end
 
 function Controller:_removeForces()
@@ -83,6 +113,15 @@ function Controller:_removeForces()
 		self.Orientation:Destroy()
 		self.Orientation = nil
 	end
+	for _, track in ipairs({ self.IdleTrack, self.MoveTrack }) do
+		if track then
+			track:Stop(0.1)
+			track:Destroy()
+		end
+	end
+	self.IdleTrack = nil
+	self.MoveTrack = nil
+	self.ActiveTrack = nil
 
 	local _, humanoid = getRig(LOCAL_PLAYER)
 	if humanoid then
@@ -110,6 +149,9 @@ function Controller:Summon()
 	self.PreviousPlatformStand = humanoid.PlatformStand
 	humanoid.PlatformStand = true
 	humanoid.AutoRotate = false
+	self.IdleTrack = loadLoopedAnimation(humanoid, IDLE_ANIMATION_ID)
+	self.MoveTrack = loadLoopedAnimation(humanoid, MOVE_ANIMATION_ID)
+	self:_playTrack(self.IdleTrack)
 
 	local attachment = root:FindFirstChild("RootAttachment")
 	if not attachment then
@@ -162,6 +204,13 @@ function Controller:Summon()
 		local velocityAlpha = 1 - math.exp(-ACCELERATION * deltaTime)
 		self.CurrentVelocity = self.CurrentVelocity:Lerp(desiredVelocity, velocityAlpha)
 		bodyVelocity.Velocity = self.CurrentVelocity
+
+		local horizontalVelocity = Vector3.new(self.CurrentVelocity.X, 0, self.CurrentVelocity.Z)
+		if horizontalVelocity.Magnitude > 1.5 then
+			self:_playTrack(self.MoveTrack)
+		else
+			self:_playTrack(self.IdleTrack)
+		end
 
 		local flatLook = Vector3.new(currentOwnerRoot.CFrame.LookVector.X, 0, currentOwnerRoot.CFrame.LookVector.Z)
 		if flatLook.Magnitude > 0.001 then
