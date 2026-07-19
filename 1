@@ -1,0 +1,234 @@
+-- ModuleScript: place in ReplicatedStorage and name it "StandController".
+-- The player's small launcher LocalScript calls Start(ownerUsername).
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+
+local LOCAL_PLAYER = Players.LocalPlayer
+
+local FOLLOW_DISTANCE = 3
+local HOVER_HEIGHT = 0.65
+local HOVER_AMPLITUDE = 0.18
+local HOVER_SPEED = 2.4
+local MAX_SPEED = 42
+local POSITION_GAIN = 5.5
+local ACCELERATION = 10
+local TURN_SPEED = 12
+
+local Controller = {}
+Controller.__index = Controller
+
+local activeController
+
+local function disconnect(connection)
+	if connection then
+		connection:Disconnect()
+	end
+end
+
+local function getRig(player)
+	local character = player and player.Character
+	if not character then return nil end
+
+	local humanoid = character:FindFirstChildOfClass("Humanoid")
+	local root = character:FindFirstChild("HumanoidRootPart")
+	if not humanoid or not root or humanoid.Health <= 0 then return nil end
+
+	return character, humanoid, root
+end
+
+local function findPlayer(username)
+	local wanted = string.lower(username)
+	for _, player in ipairs(Players:GetPlayers()) do
+		if string.lower(player.Name) == wanted then
+			return player
+		end
+	end
+	return nil
+end
+
+local function isSummonCommand(message)
+	local cleaned = string.lower(message):match("^%s*(.-)%s*$")
+	return cleaned == "." or cleaned == "summon" or cleaned == "summon!"
+end
+
+local function isDismissCommand(message)
+	local cleaned = string.lower(message):match("^%s*(.-)%s*$")
+	return cleaned == "dismiss" or cleaned == "dismiss!"
+end
+
+function Controller.new(owner)
+	return setmetatable({
+		Owner = owner,
+		Summoned = false,
+		Connections = {},
+		MotionConnection = nil,
+		BodyVelocity = nil,
+		Orientation = nil,
+		PreviousPlatformStand = false,
+		CurrentVelocity = Vector3.zero,
+		StartedAt = 0,
+	}, Controller)
+end
+
+function Controller:_removeForces()
+	disconnect(self.MotionConnection)
+	self.MotionConnection = nil
+
+	if self.BodyVelocity then
+		self.BodyVelocity:Destroy()
+		self.BodyVelocity = nil
+	end
+	if self.Orientation then
+		self.Orientation:Destroy()
+		self.Orientation = nil
+	end
+
+	local _, humanoid = getRig(LOCAL_PLAYER)
+	if humanoid then
+		humanoid.PlatformStand = self.PreviousPlatformStand
+		humanoid.AutoRotate = true
+	end
+
+	self.CurrentVelocity = Vector3.zero
+end
+
+function Controller:Dismiss()
+	self.Summoned = false
+	self:_removeForces()
+end
+
+function Controller:Summon()
+	if self.Summoned then return end
+
+	local _, humanoid, root = getRig(LOCAL_PLAYER)
+	local _, _, ownerRoot = getRig(self.Owner)
+	if not humanoid or not root or not ownerRoot then return end
+
+	self.Summoned = true
+	self.StartedAt = time()
+	self.PreviousPlatformStand = humanoid.PlatformStand
+	humanoid.PlatformStand = true
+	humanoid.AutoRotate = false
+
+	local attachment = root:FindFirstChild("RootAttachment")
+	if not attachment then
+		attachment = Instance.new("Attachment")
+		attachment.Name = "StandRootAttachment"
+		attachment.Parent = root
+	end
+
+	local bodyVelocity = Instance.new("BodyVelocity")
+	bodyVelocity.Name = "StandGlideVelocity"
+	bodyVelocity.MaxForce = Vector3.new(100000, 100000, 100000)
+	bodyVelocity.P = 2500
+	bodyVelocity.Velocity = Vector3.zero
+	bodyVelocity.Parent = root
+	self.BodyVelocity = bodyVelocity
+
+	local orientation = Instance.new("AlignOrientation")
+	orientation.Name = "StandGlideOrientation"
+	orientation.Mode = Enum.OrientationAlignmentMode.OneAttachment
+	orientation.Attachment0 = attachment
+	orientation.Responsiveness = 15
+	orientation.RigidityEnabled = false
+	orientation.MaxTorque = 100000
+	orientation.CFrame = root.CFrame
+	orientation.Parent = root
+	self.Orientation = orientation
+
+	self.MotionConnection = RunService.Heartbeat:Connect(function(deltaTime)
+		local _, localHumanoid, localRoot = getRig(LOCAL_PLAYER)
+		local _, _, currentOwnerRoot = getRig(self.Owner)
+		if not self.Summoned or not localHumanoid or not localRoot or not currentOwnerRoot then
+			self:Dismiss()
+			return
+		end
+
+		-- Three studs behind the owner's facing direction, with a subtle hover bob.
+		local elapsed = time() - self.StartedAt
+		local bob = math.sin(elapsed * math.pi * 2 * HOVER_SPEED) * HOVER_AMPLITUDE
+		local targetPosition = currentOwnerRoot.Position
+			- currentOwnerRoot.CFrame.LookVector * FOLLOW_DISTANCE
+			+ Vector3.new(0, HOVER_HEIGHT + bob, 0)
+
+		local offset = targetPosition - localRoot.Position
+		local desiredVelocity = offset * POSITION_GAIN
+		if desiredVelocity.Magnitude > MAX_SPEED then
+			desiredVelocity = desiredVelocity.Unit * MAX_SPEED
+		end
+
+		-- This acceleration smoothing is what gives the original board its glide.
+		local velocityAlpha = 1 - math.exp(-ACCELERATION * deltaTime)
+		self.CurrentVelocity = self.CurrentVelocity:Lerp(desiredVelocity, velocityAlpha)
+		bodyVelocity.Velocity = self.CurrentVelocity
+
+		local flatLook = Vector3.new(currentOwnerRoot.CFrame.LookVector.X, 0, currentOwnerRoot.CFrame.LookVector.Z)
+		if flatLook.Magnitude > 0.001 then
+			local targetFacing = CFrame.lookAt(localRoot.Position, localRoot.Position + flatLook.Unit)
+			local turnAlpha = 1 - math.exp(-TURN_SPEED * deltaTime)
+			orientation.CFrame = orientation.CFrame:Lerp(targetFacing, turnAlpha)
+		end
+	end)
+end
+
+function Controller:_beginListening()
+	table.insert(self.Connections, self.Owner.Chatted:Connect(function(message)
+		if isSummonCommand(message) then
+			self:Summon()
+		elseif isDismissCommand(message) then
+			self:Dismiss()
+		end
+	end))
+
+	table.insert(self.Connections, LOCAL_PLAYER.CharacterRemoving:Connect(function()
+		self:Dismiss()
+	end))
+
+	table.insert(self.Connections, self.Owner.CharacterRemoving:Connect(function()
+		self:Dismiss()
+	end))
+
+	table.insert(self.Connections, Players.PlayerRemoving:Connect(function(player)
+		if player == self.Owner then
+			self:Stop()
+		end
+	end))
+end
+
+function Controller:Stop()
+	self:Dismiss()
+	for _, connection in ipairs(self.Connections) do
+		disconnect(connection)
+	end
+	table.clear(self.Connections)
+	if activeController == self then
+		activeController = nil
+	end
+end
+
+function Controller.Start(ownerUsername)
+	assert(RunService:IsClient(), "StandController must be started on the client")
+	assert(type(ownerUsername) == "string" and ownerUsername ~= "", "Enter the owner's Roblox username")
+
+	if activeController then
+		activeController:Stop()
+	end
+
+	local owner = findPlayer(ownerUsername)
+	assert(owner, ("Owner @%s is not currently in this server"):format(ownerUsername))
+	assert(owner ~= LOCAL_PLAYER, "The stand player and owner must be different players")
+
+	activeController = Controller.new(owner)
+	activeController:_beginListening()
+	return activeController
+end
+
+-- When this source is run through loadstring, the tiny loader supplies this value.
+-- Keeping the controller table as a return value also makes local testing easier.
+local environment = (getgenv and getgenv()) or _G
+if environment.StandOwnerUsername then
+	Controller.Start(environment.StandOwnerUsername)
+end
+
+return Controller
